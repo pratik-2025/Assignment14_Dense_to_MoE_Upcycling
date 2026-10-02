@@ -42,7 +42,8 @@ Shift+Enter** and read each cell's output before moving on (not "Run all" — th
 * `LOADED FROM CACHE` — the finished result is already on disk, **nothing was trained**, so the cell
   finishes in a second. Delete `results/<run>.json` if you want to force a re-run.
 
-Total time on a T4: roughly 75–90 minutes (the dense parts are fast, the MoE parts are slower).
+Total time on a T4: about 2 hours (measured on my run: ~94 minutes of training steps, plus evaluation
+and checkpoint saving). The dense parts are fast; the MoE parts are about 4x slower per step.
 """)
 
 code(r"""
@@ -95,30 +96,30 @@ print(f"dense params: {d_total:,}   MoE params: total {m_total:,}, active per to
 print(f"tokens per step: {data.tokens_per_step():,}   steps: {tc.total_steps}  (switch at {tc.switch_step})")
 """)
 
-md("## Step 3 — the dense phase (steps 0 → 3,000), shared by A, B and D  ·  ~6 min")
+md("## Step 3 — the dense phase (steps 0 → 3,000), shared by A, B and D  ·  ~5 min of training")
 code(r"""
 from src.experiments import run_dense_phase, run_branch, run_scratch
 dense_log, switch_ckpt = run_dense_phase(OUT, mc, tc, data, "cuda")
 print("dense val loss at the switch:", [v["loss"] for v in dense_log["val"] if v["step"] == tc.switch_step][0])
 """)
 
-md("## Step 4 — run A: the dense model just keeps training (control)  ·  ~6 min")
+md("## Step 4 — run A: the dense model just keeps training (control)  ·  ~5 min of training")
 code(r"""
 log_A = run_branch(OUT, "A_dense_cont", None, mc, tc, data, "cuda", switch_ckpt, dense_log)
 """)
 
-md("## Step 5 — run B: convert by drop-upcycling, keep training (the main run)  ·  ~15 min")
+md("## Step 5 — run B: convert by drop-upcycling, keep training (the main run)  ·  ~20 min of training")
 code(r"""
 log_B = run_branch(OUT, "B_moe_drop", "drop", mc, tc, data, "cuda", switch_ckpt, dense_log)
 print("val right after conversion:", [v["loss"] for v in log_B["val"] if v["step"] == tc.switch_step][0])
 """)
 
-md("## Step 6 — run D: convert by cloning slices (no redraw)  ·  ~15 min")
+md("## Step 6 — run D: convert by cloning slices (no redraw)  ·  ~20 min of training")
 code(r"""
 log_D = run_branch(OUT, "D_moe_clone", "clone", mc, tc, data, "cuda", switch_ckpt, dense_log)
 """)
 
-md("## Step 7 — run C: the same MoE from scratch, full 6,000 steps  ·  ~30 min")
+md("## Step 7 — run C: the same MoE from scratch, full 6,000 steps  ·  ~45 min of training")
 code(r"""
 log_C = run_scratch(OUT, "C_moe_scratch", mc, tc, data, "cuda")
 """)
@@ -128,7 +129,7 @@ code(r"""
 from src.analysis import make_all
 from IPython.display import Image, display
 S = make_all(OUT)
-for f in ["fig1_loss_curves", "fig2_gap_vs_dense", "fig3_expert_health", "fig4_final_load_heatmap", "fig5_throughput"]:
+for f in ["fig1_loss_curves", "fig2_gap_vs_dense", "fig3_expert_health", "fig4_worst_load_heatmap", "fig5_throughput"]:
     display(Image(os.path.join(OUT, "figures", f + ".png")))
 """)
 

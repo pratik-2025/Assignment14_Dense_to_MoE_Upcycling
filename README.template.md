@@ -16,8 +16,6 @@ would prove nothing — any model that keeps training keeps lowering its loss.
 
 ## 1. Results on the T4 (the submitted run)
 
-> Status: cells marked PENDING are filled in automatically once the T4 results are added to `results/`.
-
 | run | total params | active params / token | final val loss | vs A | jump at switch | steps to get back to the dense loss | dead experts (final / peak) | tokens/s |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | A — dense, keeps training | {{main:runs.A_dense_cont.params_total:,}} | {{main:runs.A_dense_cont.params_active:,}} | {{main:runs.A_dense_cont.final_val:.4f}} | — | — | — | — | {{main:runs.A_dense_cont.tok_per_sec:,.0f}} |
@@ -29,12 +27,84 @@ Dense validation loss at the switch (step {{main:switch_step}}): **{{main:dense_
 Dead expert = got less than 10% of its fair share of tokens in a 100-step window; counted over all
 6 layers × 32 experts = 192 expert slots.
 
-**Findings:** *written after the T4 run — see the CPU pilot (section 6) for what the same design did at small scale.*
+### Findings
+
+**The short version.** The converted model kept training and kept lowering its loss — the assignment's
+condition is met. But in the 3,000 steps after conversion it only *caught up* with the dense model; it
+did not beat it ({{main:runs.B_moe_drop.final_gap_vs_A:+.4f}} nats/byte at the end, which is within
+noise for a single run). The reason is not the MoE idea itself: the same MoE trained from scratch (C)
+was ahead of the dense model at every evaluation from step 400 to the end. The reason is that **the router collapsed for about half of
+the post-conversion budget**, right after the random-picking period ended. My CPU pilot (section 6)
+showed the same collapse in a milder form; at full size it was much worse.
+
+**1. It keeps training and keeps reducing loss.** Run B's validation loss at each 500-step check
+after the switch:
+
+| step | 3,000 (just converted) | 3,500 | 4,000 | 4,500 | 5,000 | 5,500 | 6,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B val loss | {{main:runs.B_moe_drop.val_by_step.3000:.4f}} | {{main:runs.B_moe_drop.val_by_step.3500:.4f}} | {{main:runs.B_moe_drop.val_by_step.4000:.4f}} | {{main:runs.B_moe_drop.val_by_step.4500:.4f}} | {{main:runs.B_moe_drop.val_by_step.5000:.4f}} | {{main:runs.B_moe_drop.val_by_step.5500:.4f}} | {{main:runs.B_moe_drop.val_by_step.6000:.4f}} |
+| B minus A | {{main:runs.B_moe_drop.gap_vs_A_by_step.3000:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.3500:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.4000:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.4500:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.5000:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.5500:+.4f}} | {{main:runs.B_moe_drop.gap_vs_A_by_step.6000:+.4f}} |
+
+Every check is lower than the one before, and the gap to the dense model shrinks at every check. It
+was back below the dense model's loss at the switch ({{main:dense_val_at_switch:.4f}}) after
+{{main:runs.B_moe_drop.steps_to_recover}} steps.
+
+**2. Converting costs a big loss jump, but most of it is gone in 10 steps.** Right after conversion B
+was at {{main:runs.B_moe_drop.val_right_after_switch:.4f}} (a jump of {{main:runs.B_moe_drop.jump:+.4f}}),
+because half of every routed expert's neurons are fresh random weights. Ten steps later it was at
+{{main:runs.B_moe_drop.post_switch_curve.1.1:.4f}}, and {{main:runs.B_moe_drop.post_switch_curve.6.1:.4f}}
+by step {{main:runs.B_moe_drop.post_switch_curve.6.0}}. Cloning (D) jumped less
+({{main:runs.D_moe_clone.jump:+.4f}}) because nothing is redrawn.
+
+**3. Why B did not pull ahead: the router collapsed.** For the first 300 steps the router picks experts
+by random sampling; the busiest expert never got more than {{main:runs.B_moe_drop.max_ratio_during_explore:.2f}}×
+its fair share. Within 100 steps of switching back to plain top-6, a few experts in several layers
+were being picked by (almost) **every** token — {{main:runs.B_moe_drop.max_ratio_peak:.2f}}× their fair share,
+which is the most possible ({{main:runs.B_moe_drop.max_ratio_possible:.2f}}× = 32 experts / 6 picks) —
+and up to {{main:runs.B_moe_drop.dead_experts_peak}} of the 192 experts got almost nothing
+({{main:runs.D_moe_clone.dead_experts_peak}} in D). This lasted from the window ending at step
+{{main:runs.B_moe_drop.collapse_first_step}} to the one ending at {{main:runs.B_moe_drop.collapse_last_step}}
+in B, and until {{main:runs.D_moe_clone.collapse_last_step}} in D. For that stretch, the MoE was
+effectively a small model running the same few experts for every token, so the extra experts were
+paying for nothing. Once balance came back, B's gap to the dense model kept closing.
+
+Why the balancing bias was so slow [likely]: it moves 0.001 per step. At the end, B's biases spanned
+{{main:runs.B_moe_drop.bias_final_min:.3f}} to {{main:runs.B_moe_drop.bias_final_max:.3f}} — a spread of
+several hundred steps' worth of nudges. DeepSeek-V3 uses 0.001 over hundreds of thousands of steps, so a
+few hundred steps of correction is nothing for them; for me the collapse covered close to half of
+the post-conversion budget. (The
+transcript said 0.01, which would have been ten times faster. I did not test it.)
+
+**4. The MoE idea itself works when routing is healthy.** Run C — the same MoE trained from scratch —
+was ahead of the dense model at every check from step 3,000 ({{main:runs.C_moe_scratch.gap_vs_A_by_step.3000:+.4f}})
+to step 6,000 ({{main:runs.C_moe_scratch.final_gap_vs_A:+.4f}}), with the same active compute per
+token. Its routing stayed healthy throughout: worst moment {{main:runs.C_moe_scratch.dead_experts_peak}}
+dead expert, busiest expert {{main:runs.C_moe_scratch.max_ratio_peak:.2f}}× fair share. So the collapse
+in B and D is a conversion problem, not an MoE problem.
+
+**5. The cloned experts stayed near-copies (Rohan's V4 warning).** In D, the most alike pair of
+experts started as exact copies (cosine similarity {{main:runs.D_moe_clone.expert_similarity_at_birth_max:.2f}})
+and was still at {{main:runs.D_moe_clone.expert_similarity_final_max:.2f}} after 3,000 steps (layer
+average), against {{main:runs.B_moe_drop.expert_similarity_final_max:.2f}} in B. D also had the worse
+collapse: more dead experts, and it lasted longer. Same final loss as B, but less useful experts.
+
+**6. At this size, dense wins on wall-clock time.** On the T4 an MoE step was
+{{main:dense_speed_over_moe:.1f}}× slower than a dense step ({{main:runs.B_moe_drop.tok_per_sec:,.0f}}
+vs {{main:runs.A_dense_cont.tok_per_sec:,.0f}} tokens/s), even though both do the same arithmetic per
+token — the router, sorting tokens by expert and 32 small matrix multiplies cost more than one big one.
+Run A reached {{main:runs.A_dense_cont.final_val:.4f}} in {{main:runs.A_dense_cont.gpu_seconds_total:,.0f}} s
+of training steps (dense phase included, evaluation excluded); B reached {{main:runs.B_moe_drop.final_val:.4f}} in {{main:runs.B_moe_drop.gpu_seconds_total:,.0f}} s;
+C needed {{main:scratch_gpu_seconds_to_match_B:,.0f}} s (step {{main:scratch_steps_to_match_B}}) to reach B's
+final loss. Per step, the MoE (C) wins; per second, the dense model wins.
+
+**What I would change next time:** fade the random picking out gradually instead of switching it off;
+use a faster bias step (e.g. 0.01) for the first ~1,000 steps after conversion; and give the converted
+model a longer budget after the switch.
 
 ![loss curves](figures/fig1_loss_curves.png)
 ![gap vs dense](figures/fig2_gap_vs_dense.png)
 ![expert health](figures/fig3_expert_health.png)
-![final load heatmap](figures/fig4_final_load_heatmap.png)
+![worst load heatmap](figures/fig4_worst_load_heatmap.png)
 ![throughput](figures/fig5_throughput.png)
 
 ---
@@ -158,8 +228,8 @@ below the dense value somewhere between +100 and +200.)
 
 **What the pilot showed:**
 
-1. **The converted model keeps training and keeps reducing loss — and ends up better than not
-   converting.** B's final loss minus the dense control A's: **{{pilot:runs.B_moe_drop.final_gap_vs_A:+.4f}}**
+1. **The converted model keeps training and keeps reducing loss — and (in the pilot only) ends up
+   better than not converting.** This did not hold at full size within the budget (section 1). B's final loss minus the dense control A's: **{{pilot:runs.B_moe_drop.final_gap_vs_A:+.4f}}**
    nats/byte (negative = better), with the same active compute per token. It crossed below A around step 1,200.
 2. **Conversion costs a loss jump first.** Dense loss at the switch was
    {{pilot:dense_val_at_switch:.4f}}; right after drop-upcycling it was
@@ -216,10 +286,14 @@ below the dense value somewhere between +100 and +200.)
   step, dense → 32 experts.
 * **No expert parallelism.** Everything is on one GPU, so the GPU-to-GPU traffic that dominates real
   MoE training does not appear here.
-* **The MoE is slower per step at this size, not faster.** Same active arithmetic, but the router,
-  sorting tokens by expert, and 32 small matrix multiplies per layer cost more than one big one. The
-  compute savings Rohan described only show up at scale (thousands of neurons per expert, many GPUs).
-* **Single seed, short runs.** Differences smaller than ~0.01 nats/byte should not be read as real.
+* **The MoE is slower per step at this size, not faster** ({{main:dense_speed_over_moe:.1f}}× on the T4).
+  My MoE layer loops over the 32 experts in plain PyTorch; a fused kernel would close part of the gap.
+  The compute savings Rohan described only show up at scale (thousands of neurons per expert, many GPUs).
+* **I designed the collapse in.** Switching random picking off in one step, with a slow bias, is my
+  choice, not something from the lecture. The pilot warned me (section 6, point 4), but I kept the agreed
+  settings for the T4 run instead of changing the design between the pilot and the real run.
+* **Single seed, short runs.** Differences smaller than ~0.01 nats/byte should not be read as real —
+  that includes the B-vs-A and D-vs-A final gaps.
 
 ---
 
@@ -230,7 +304,7 @@ pip install -r requirements.txt
 python -m tests.test_all          # 20 checks, CPU, ~10 s
 python run_all.py --smoke         # whole pipeline on synthetic text, CPU, ~20 s (plumbing check only)
 python run_all.py --pilot         # section 6: real TinyStories, scaled down, CPU, ~35 min
-python run_all.py                 # section 1: the real run, needs a GPU (~75-90 min on a T4)
+python run_all.py                 # section 1: the real run, needs a GPU (about 2 hours on a T4)
 python fill_readme.py             # rebuild this README from results/ and pilot/results/
 python fill_readme.py --check     # verify every number in the README against the files on disk
 ```

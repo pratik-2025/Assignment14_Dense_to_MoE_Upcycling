@@ -1,7 +1,7 @@
 """
 Run everything from the command line (the notebook calls the same functions).
 
-    python run_all.py            # the real experiment (needs a GPU; ~75-90 min on a Colab T4)
+    python run_all.py            # the real experiment (needs a GPU; about 2 hours on a Colab T4)
     python run_all.py --smoke    # tiny CPU version on synthetic text, ~3 min, checks the plumbing only
 
 Re-running is safe: finished runs are LOADED FROM CACHE, interrupted runs RESUME.

@@ -83,7 +83,8 @@ def summarize(logs):
             continue
         lg = logs[name]
         r = {"params_total": lg["params_total"], "params_active": lg["params_active"],
-             "final_val": val_at(lg, total)}
+             "final_val": val_at(lg, total),
+             "val_by_step": {str(v["step"]): v["loss"] for v in lg["val"] if v["step"] % 500 == 0}}
         r["tok_per_sec"], r["gpu_seconds_own_segment"] = seg_speed(lg)
         r["gpu_seconds_total"] = r["gpu_seconds_own_segment"] + (S["dense_phase_gpu_seconds"] if lg.get("branched_from") else 0)
         if lg.get("branched_from") and lg["kind"].startswith("moe"):
@@ -107,6 +108,13 @@ def summarize(logs):
             r["explore_end_step"] = born + lg["train_config"]["explore_steps"]
             during = [x["max_ratio"] for x in ls if x["step"] <= r["explore_end_step"]]
             r["max_ratio_during_explore"] = max(during) if during else None
+            # "collapse": windows where the busiest expert is near the maximum possible load
+            # (every token picks it -> E/k times its fair share)
+            E, k = lg["model_config"]["n_experts"], lg["model_config"]["top_k"]
+            r["max_ratio_possible"] = E / k
+            col = [x["step"] for x in ls if x["max_ratio"] >= 0.9 * E / k]
+            r["collapse_first_step"] = col[0] if col else None
+            r["collapse_last_step"] = col[-1] if col else None
             r["n_expert_slots"] = len(lg["load"][0]["counts"]) * len(lg["load"][0]["counts"][0])
             b = np.array(lg["bias"][-1]["bias"])
             r["bias_final_min"], r["bias_final_max"] = float(b.min()), float(b.max())
@@ -117,6 +125,13 @@ def summarize(logs):
         S["runs"][name] = r
     R = S["runs"]
     if "A_dense_cont" in R:
+        Av = {v["step"]: v["loss"] for v in logs["A_dense_cont"]["val"]}
+        for n in ("B_moe_drop", "D_moe_clone", "C_moe_scratch"):
+            if n in R:
+                R[n]["gap_vs_A_by_step"] = {str(v["step"]): v["loss"] - Av[v["step"]] for v in logs[n]["val"]
+                                            if v["step"] in Av and v["step"] % 500 == 0}
+        if "B_moe_drop" in R:
+            S["dense_speed_over_moe"] = R["A_dense_cont"]["tok_per_sec"] / R["B_moe_drop"]["tok_per_sec"]
         for n in ("B_moe_drop", "D_moe_clone", "C_moe_scratch"):
             if n in R:
                 R[n]["final_gap_vs_A"] = R[n]["final_val"] - R["A_dense_cont"]["final_val"]
@@ -179,15 +194,29 @@ def make_figures(root, logs, S):
     a1.set_xlabel("step"); a1.set_ylabel("val loss (nats/byte)")
     a1.legend(loc="upper right")
     win = int(0.15 * total)
+    dsw = S["dense_val_at_switch"]
+    pre = dp[(dp[:, 0] >= sw - win // 3) & (dp[:, 0] <= sw)]
+    a2.plot(pre[:, 0], pre[:, 1], color=COL["dense_phase"], lw=2, marker="o", ms=4)
+    top = dsw + 0.15
+    off_chart = []
     for n in present:
         c = full_val_curve(n, logs)
-        m = (c[:, 0] >= sw - win // 3) & (c[:, 0] <= sw + win)
-        a2.plot(c[m, 0], c[m, 1], color=COL[n], lw=2, marker="o", ms=4, label=LABEL[n])
+        lo_s = sw if logs[n].get("branched_from") else sw - win // 3
+        m = (c[:, 0] >= lo_s) & (c[:, 0] <= sw + win)
+        a2.plot(c[m, 0], np.minimum(c[m, 1], top), color=COL[n], lw=2, marker="o", ms=4, label=LABEL[n])
+        if logs[n].get("branched_from") and c[m, 1].max() > top:
+            off_chart.append((n, c[m, 1].max()))
+    for i, (n, v) in enumerate(off_chart):
+        a2.annotate(f"{LABEL[n][:1]}: {v:.2f} at step {sw} (off the chart)", (sw, top), xytext=(60, -14 - 13 * i),
+                    textcoords="offset points", fontsize=8, color="#0b0b0b")
+    a2.set_ylim(min(full_val_curve(n, logs)[:, 1][(full_val_curve(n, logs)[:, 0] >= sw - win // 3)
+                                                     & (full_val_curve(n, logs)[:, 0] <= sw + win)].min()
+                    for n in present) - 0.01, top + 0.01)
     a2.axvline(sw, color="#52514e", lw=1, ls="--")
-    a2.axhline(S["dense_val_at_switch"], color="#9a9893", lw=1, ls=":")
-    a2.text(0.99, S["dense_val_at_switch"], "dense loss at the switch ", transform=a2.get_yaxis_transform(),
+    a2.axhline(dsw, color="#9a9893", lw=1, ls=":")
+    a2.text(0.99, dsw, "dense loss at the switch ", transform=a2.get_yaxis_transform(),
             ha="right", va="bottom", fontsize=8, color="#52514e")
-    a2.set_title("Zoom on the switch: the jump, and how long it takes to get back")
+    a2.set_title("Zoom on the switch: the jump (capped, values noted), and the climb back")
     a2.set_xlabel("step"); a2.set_ylabel("val loss (nats/byte)")
     fig.tight_layout(); fig.savefig(os.path.join(fig_dir, "fig1_loss_curves.png"), dpi=140); plt.close(fig)
 
@@ -197,14 +226,14 @@ def make_figures(root, logs, S):
         A = dict(map(tuple, full_val_curve("A_dense_cont", logs)))
         for n in [x for x in present if x != "A_dense_cont"]:
             c = full_val_curve(n, logs)
-            pts = [(s, l - A[s]) for s, l in c if s >= sw and s in A]
+            pts = [(s, l - A[s]) for s, l in c if s >= sw + 100 and s in A]
             if pts:
                 p = np.array(pts)
                 ax.plot(p[:, 0], p[:, 1], color=COL[n], lw=2, label=LABEL[n])
-                ax.annotate(f"{p[-1, 1]:+.3f}", (p[-1, 0], p[-1, 1]), xytext=(4, {"B_moe_drop": 9, "D_moe_clone": 0, "C_moe_scratch": -9}.get(n, 0)),
+                ax.annotate(f"{p[-1, 1]:+.3f}", (p[-1, 0], p[-1, 1]), xytext=(4, {"B_moe_drop": 10, "D_moe_clone": -2, "C_moe_scratch": -9}.get(n, 0)),
                             textcoords="offset points", va="center", fontsize=9, color="#0b0b0b")
         ax.axhline(0, color="#52514e", lw=1)
-        ax.set_title("Val loss minus run A (dense control); below zero = better than not converting")
+        ax.set_title(f"Val loss minus run A, from step {sw + 100} (below zero = better than staying dense)")
         ax.set_xlabel("step"); ax.set_ylabel("loss difference (nats/byte)")
         ax.legend(loc="upper right")
         fig.tight_layout(); fig.savefig(os.path.join(fig_dir, "fig2_gap_vs_dense.png"), dpi=140); plt.close(fig)
@@ -234,18 +263,20 @@ def make_figures(root, logs, S):
         fig, axes = plt.subplots(len(moe_runs), 1, figsize=(9, 2.2 * len(moe_runs) + 0.8), gridspec_kw={"hspace": 0.6})
         axes = np.atleast_1d(axes)
         for ax, n in zip(axes, moe_runs):
-            c = np.array(logs[n]["load"][-1]["counts"], dtype=float)
+            ls = load_stats(logs[n])
+            wi = max(range(len(ls)), key=lambda i: ls[i]["dead"])
+            c = np.array(logs[n]["load"][wi]["counts"], dtype=float)
             ratio = c / (c.sum(axis=1, keepdims=True) / c.shape[1])
             im = ax.imshow(np.log2(np.clip(ratio, 1 / 16, 16)), aspect="auto", cmap=cmap,
                            norm=TwoSlopeNorm(vcenter=0, vmin=-4, vmax=4))
-            ax.set_title(f"{LABEL[n]}: expert load in the last window", fontsize=10)
+            ax.set_title(f"{LABEL[n]}: expert load in its worst window (ending step {ls[wi]['step']}, {ls[wi]['dead']} dead)", fontsize=10)
             ax.set_ylabel("layer"); ax.grid(False)
             ax.set_yticks(range(c.shape[0])); ax.set_yticklabels([str(i + 1) for i in range(c.shape[0])])
             ax.set_xticks(range(0, c.shape[1], max(1, c.shape[1] // 16)))
         axes[-1].set_xlabel("expert")
         cb = fig.colorbar(im, ax=list(axes), shrink=0.8)
         cb.set_ticks([-4, -2, 0, 2, 4]); cb.set_ticklabels(["1/16x", "1/4x", "fair", "4x", "16x"])
-        fig.savefig(os.path.join(fig_dir, "fig4_final_load_heatmap.png"), dpi=140, bbox_inches="tight"); plt.close(fig)
+        fig.savefig(os.path.join(fig_dir, "fig4_worst_load_heatmap.png"), dpi=140, bbox_inches="tight"); plt.close(fig)
 
     # ---- 5. speed
     fig, ax = plt.subplots(figsize=(7, 3.4))
